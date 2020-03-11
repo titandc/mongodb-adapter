@@ -15,12 +15,16 @@
 package mongodbadapter
 
 import (
-	"errors"
-	"runtime"
-
+	"context"
+	"fmt"
 	"github.com/casbin/casbin/v2/model"
-	"github.com/casbin/casbin/v2/persist"
-	"github.com/globalsign/mgo"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"log"
+	"strings"
+	"time"
 )
 
 // CasbinRule represents a rule in Casbin.
@@ -35,97 +39,102 @@ type CasbinRule struct {
 }
 
 // adapter represents the MongoDB adapter for policy storage.
-type adapter struct {
-	dialInfo   *mgo.DialInfo
-	session    *mgo.Session
-	collection *mgo.Collection
-	filtered   bool
-}
-
-// finalizer is the destructor for adapter.
-func finalizer(a *adapter) {
-	a.close()
+type Adapter struct {
+	client   *mongo.Client
+	ctx      context.Context
+	servers  []string
+	dbName   string
+	collName string
+	filtered bool
 }
 
 // NewAdapter is the constructor for Adapter. If database name is not provided
 // in the Mongo URL, 'casbin' will be used as database name.
-func NewAdapter(url string) persist.Adapter {
-	dI, err := mgo.ParseURL(url)
+func NewAdapter(caFilePath,
+	certificateKeyFilePath,
+	replicaSet,
+	database string,
+	servers []string) (*Adapter, error) {
+	a := &Adapter{
+		servers:  servers,
+		dbName:   database,
+		collName: "casbin_rules",
+		filtered: false,
+	}
+
+	if err := a.ConnectToDB(caFilePath, certificateKeyFilePath, replicaSet); err != nil {
+		return nil, err
+	}
+
+	return a, nil
+}
+
+func (a *Adapter) ConnectToDB(caFilePath, certificateKeyFilePath, replicaSet string) error {
+	var err error
+
+	uri_servers := strings.Join(a.servers[:], ",")
+	uri := "mongodb://%s/?tlsCAFile=%s&tlsCertificateKeyFile=%s"
+	uri = fmt.Sprintf(uri, uri_servers, caFilePath, certificateKeyFilePath)
+	credential := options.Credential{
+		AuthMechanism: "MONGODB-X509",
+		AuthSource:    "$external",
+	}
+	a.ctx, _ = context.WithTimeout(context.Background(), 10*time.Second)
+	a.client, err = mongo.Connect(a.ctx, options.Client().ApplyURI(uri).SetAuth(credential).SetReplicaSet(replicaSet))
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	return NewAdapterWithDialInfo(dI)
-}
-
-// NewAdapterWithDialInfo is an alternative constructor for Adapter
-// that does the same as NewAdapter, but uses mgo.DialInfo instead of a Mongo URL
-func NewAdapterWithDialInfo(dI *mgo.DialInfo) persist.Adapter {
-	a := &adapter{dialInfo: dI}
-	a.filtered = false
-
-	// Open the DB, create it if not existed.
-	a.open()
-
-	// Call the destructor when the object is released.
-	runtime.SetFinalizer(a, finalizer)
-
-	return a
-}
-
-// NewFilteredAdapter is the constructor for FilteredAdapter.
-// Casbin will not automatically call LoadPolicy() for a filtered adapter.
-func NewFilteredAdapter(url string) persist.FilteredAdapter {
-	a := NewAdapter(url).(*adapter)
-	a.filtered = true
-
-	return a
-}
-
-func (a *adapter) open() {
-	// FailFast will cause connection and query attempts to fail faster when
-	// the server is unavailable, instead of retrying until the configured
-	// timeout period. Note that an unavailable server may silently drop
-	// packets instead of rejecting them, in which case it's impossible to
-	// distinguish it from a slow server, so the timeout stays relevant.
-	a.dialInfo.FailFast = true
-
-	if a.dialInfo.Database == "" {
-		a.dialInfo.Database = "casbin"
+	if err := a.client.Ping(a.ctx, readpref.Primary()); err != nil {
+		return err
 	}
+	fmt.Println("Successfully connected to MongoDB")
 
-	session, err := mgo.DialWithInfo(a.dialInfo)
-	if err != nil {
-		panic(err)
+	if err = a.CreateDBIndex(); err != nil {
+		return err
 	}
+	return nil
+}
 
-	db := session.DB(a.dialInfo.Database)
-	collection := db.C("casbin_rule")
+func (a *Adapter) CreateDBIndex() error {
 
-	a.session = session
-	a.collection = collection
-
+	collection := a.client.Database(a.dbName).Collection(a.collName)
 	indexes := []string{"ptype", "v0", "v1", "v2", "v3", "v4", "v5"}
 	for _, k := range indexes {
-		if err := a.collection.EnsureIndexKey(k); err != nil {
-			panic(err)
+		modIndex := mongo.IndexModel{
+			Keys: bson.M{
+				k: 1, // index in ascending order
+			}, Options: nil,
 		}
-	}
-}
-
-func (a *adapter) close() {
-	a.session.Close()
-}
-
-func (a *adapter) dropTable() error {
-	session := a.session.Copy()
-	defer session.Close()
-
-	err := a.collection.With(session).DropCollection()
-	if err != nil {
-		if err.Error() != "ns not found" {
+		name, err := collection.Indexes().CreateOne(context.Background(), modIndex)
+		if err != nil {
 			return err
 		}
+		fmt.Println("Successfully create index", name)
+	}
+
+	/* only for debug
+	cursor, err := collection.Indexes().List(context.Background(), nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var results []bson.M
+	if err := cursor.All(context.Background(), &results); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(results)*/
+
+	return nil
+}
+
+func (a *Adapter) close() {
+	_ = a.client.Disconnect(a.ctx)
+}
+
+func (a *Adapter) dropTable() error {
+	collection := a.client.Database(a.dbName).Collection(a.collName)
+	if err := collection.Drop(a.ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -176,13 +185,15 @@ LineEnd:
 }
 
 // LoadPolicy loads policy from database.
-func (a *adapter) LoadPolicy(model model.Model) error {
-	return a.LoadFilteredPolicy(model, nil)
+func (a *Adapter) LoadPolicy(model model.Model) error {
+	return a.LoadFilteredPolicy(model, bson.D{})
 }
 
 // LoadFilteredPolicy loads matching policy lines from database. If not nil,
 // the filter must be a valid MongoDB selector.
-func (a *adapter) LoadFilteredPolicy(model model.Model, filter interface{}) error {
+func (a *Adapter) LoadFilteredPolicy(model model.Model, filter interface{}) error {
+	var err error
+
 	if filter == nil {
 		a.filtered = false
 	} else {
@@ -190,19 +201,26 @@ func (a *adapter) LoadFilteredPolicy(model model.Model, filter interface{}) erro
 	}
 	line := CasbinRule{}
 
-	session := a.session.Copy()
-	defer session.Close()
+	collection := a.client.Database(a.dbName).Collection(a.collName)
+	cursor, err := collection.Find(context.Background(), filter)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(context.Background())
 
-	iter := a.collection.With(session).Find(filter).Iter()
-	for iter.Next(&line) {
+	for cursor.Next(a.ctx) {
+		err := cursor.Decode(&line)
+		if err != nil {
+			log.Fatal(err)
+			return err
+		}
 		loadPolicyLine(line, model)
 	}
-
-	return iter.Close()
+	return nil
 }
 
 // IsFiltered returns true if the loaded policy has been filtered.
-func (a *adapter) IsFiltered() bool {
+func (a *Adapter) IsFiltered() bool {
 	return a.filtered
 }
 
@@ -234,9 +252,9 @@ func savePolicyLine(ptype string, rule []string) CasbinRule {
 }
 
 // SavePolicy saves policy to database.
-func (a *adapter) SavePolicy(model model.Model) error {
+func (a *Adapter) SavePolicy(model model.Model) error {
 	if a.filtered {
-		return errors.New("cannot save a filtered policy")
+		return fmt.Errorf("cannot save a filtered policy")
 	}
 	if err := a.dropTable(); err != nil {
 		return err
@@ -258,42 +276,43 @@ func (a *adapter) SavePolicy(model model.Model) error {
 		}
 	}
 
-	session := a.session.Copy()
-	defer session.Close()
-
-	return a.collection.With(session).Insert(lines...)
+	collection := a.client.Database(a.dbName).Collection(a.collName)
+	res, err := collection.InsertMany(context.Background(), lines)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("inserted documents with IDs %v\n", res.InsertedIDs)
+	return nil
 }
 
 // AddPolicy adds a policy rule to the storage.
-func (a *adapter) AddPolicy(sec string, ptype string, rule []string) error {
+func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
 	line := savePolicyLine(ptype, rule)
 
-	session := a.session.Copy()
-	defer session.Close()
-
-	return a.collection.With(session).Insert(line)
+	collection := a.client.Database(a.dbName).Collection(a.collName)
+	res, err := collection.InsertOne(context.Background(), line)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("inserted documents with IDs %d\n", res.InsertedID)
+	return nil
 }
 
 // RemovePolicy removes a policy rule from the storage.
-func (a *adapter) RemovePolicy(sec string, ptype string, rule []string) error {
+func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 	line := savePolicyLine(ptype, rule)
 
-	session := a.session.Copy()
-	defer session.Close()
-
-	if err := a.collection.With(session).Remove(line); err != nil {
-		switch err {
-		case mgo.ErrNotFound:
-			return nil
-		default:
-			return err
-		}
+	collection := a.client.Database(a.dbName).Collection(a.collName)
+	res, err := collection.DeleteOne(context.Background(), line, nil)
+	if err != nil {
+		return err
 	}
+	fmt.Printf("deleted %v documents\n", res.DeletedCount)
 	return nil
 }
 
 // RemoveFilteredPolicy removes policy rules that match the filter from the storage.
-func (a *adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int, fieldValues ...string) error {
+func (a *Adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int, fieldValues ...string) error {
 	selector := make(map[string]interface{})
 	selector["ptype"] = ptype
 
@@ -328,9 +347,11 @@ func (a *adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int,
 		}
 	}
 
-	session := a.session.Copy()
-	defer session.Close()
-
-	_, err := a.collection.With(session).RemoveAll(selector)
+	collection := a.client.Database(a.dbName).Collection(a.collName)
+	res, err := collection.DeleteMany(context.Background(), selector, nil)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("deleted %v documents\n", res.DeletedCount)
 	return err
 }
