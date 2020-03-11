@@ -5,7 +5,7 @@ MongoDB Adapter is the [Mongo DB](https://www.mongodb.com) adapter for [Casbin](
 
 ## Installation
 
-    go get -u github.com/casbin/mongodb-adapter/v2
+    go get -u github.com/titandc/mongodb-adapter/v2
 
 ## Simple Example
 
@@ -14,20 +14,19 @@ package main
 
 import (
 	"github.com/casbin/casbin/v2"
-	"github.com/casbin/mongodb-adapter/v2"
+	"github.com/titandc/mongodb-adapter/v2"
 )
 
 func main() {
 	// Initialize a MongoDB adapter and use it in a Casbin enforcer:
-	// The adapter will use the database named "casbin".
-	// If it doesn't exist, the adapter will create it automatically.
-	a := mongodbadapter.NewAdapter("127.0.0.1:27017") // Your MongoDB URL. 
-	
-	// Or you can use an existing DB "abc" like this:
-	// The adapter will use the table named "casbin_rule".
-	// If it doesn't exist, the adapter will create it automatically.
-	// a := mongodbadapter.NewAdapter("127.0.0.1:27017/abc")
+	// The adapter currently requires X509 client authentication to the cluster.
+	caFilePath := "/path/to/ca.crt"
+	certificateKeyFilePath := "/path/to/client-cert.pem"
+	replicaSet := "rs0"
+	databaseName := "db1"
+	mongodbServers := [...]string{mongodb-0:27017, mongodb-1:27017, mongodb-2:27017}
 
+	a := mongodbadapter.NewAdapter(caFilePath, certificateKeyFilePath, replicaSet, databaseName, mongodbServers)
 	e, err := casbin.NewEnforcer("examples/rbac_model.conf", a)
 	if err != nil {
 		panic(err)
@@ -51,7 +50,7 @@ func main() {
 ## Filtered Policies
 
 ```go
-import "github.com/globalsign/mgo/bson"
+import "go.mongodb.org/mongo-driver/bson"
 
 // This adapter also implements the FilteredAdapter interface. This allows for
 // efficent, scalable enforcement of very large policies:
